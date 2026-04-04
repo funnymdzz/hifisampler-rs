@@ -297,25 +297,292 @@ pub fn peak(signal: &[f32]) -> f32 {
     signal.iter().map(|x| x.abs()).fold(0.0f32, f32::max)
 }
 
-/// Simple loudness normalization to target LUFS (simplified ITU-R BS.1770).
-/// For a proper implementation, would need pyloudnorm equivalent in Rust.
-/// This is a simplified version that normalizes to a target RMS level.
-pub fn loudness_normalize(audio: &[f32], target_lufs: f32, strength: f32) -> Vec<f32> {
+// ── ITU-R BS.1770-4 loudness measurement ──────────────────────────────
+
+/// Second-order biquad filter coefficients (Direct Form I).
+struct BiquadCoeffs {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+}
+
+/// K-weighting stage 1: high-shelf filter (44 100 Hz).
+/// Boosts ~2–4 kHz by ≈ 4 dB — models the acoustic effect of the head.
+fn k_weight_shelf_44100() -> BiquadCoeffs {
+    BiquadCoeffs {
+        b0: 1.53512485958697,
+        b1: -2.69169618940638,
+        b2: 1.19839281085285,
+        a1: -1.69065929318241,
+        a2: 0.73248077421585,
+    }
+}
+
+/// K-weighting stage 2: high-pass (RLB) filter (44 100 Hz).
+fn k_weight_highpass_44100() -> BiquadCoeffs {
+    BiquadCoeffs {
+        b0: 1.0,
+        b1: -2.0,
+        b2: 1.0,
+        a1: -1.99004745483398,
+        a2: 0.99007225036621,
+    }
+}
+
+/// Apply a biquad filter (Direct Form I) in-place, returning a new buffer.
+fn apply_biquad(c: &BiquadCoeffs, input: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0f64; input.len()];
+    let (mut x1, mut x2) = (0.0f64, 0.0f64);
+    let (mut y1, mut y2) = (0.0f64, 0.0f64);
+    for (i, &x0) in input.iter().enumerate() {
+        let y0 = c.b0 * x0 + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+        out[i] = y0;
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
+    }
+    out
+}
+
+/// Measure integrated loudness in LUFS (ITU-R BS.1770-4).
+///
+/// 1. Apply K-weighting (two biquad stages).
+/// 2. Split into overlapping 400 ms blocks (75 % overlap → hop = 100 ms).
+/// 3. Compute mean-square power per block.
+/// 4. Absolute gate: discard blocks < −70 LUFS.
+/// 5. Relative gate: discard blocks < (mean of step 4) − 10 dB.
+/// 6. Return integrated loudness of remaining blocks.
+pub fn measure_lufs(audio: &[f32], sample_rate: u32, block_size: f64) -> f64 {
+    if audio.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+
+    let audio_f64: Vec<f64> = audio.iter().map(|&x| x as f64).collect();
+
+    // K-weighting (currently only 44 100 Hz coefficients)
+    let weighted = apply_biquad(
+        &k_weight_highpass_44100(),
+        &apply_biquad(&k_weight_shelf_44100(), &audio_f64),
+    );
+
+    let block_samples = (sample_rate as f64 * block_size).round() as usize;
+    let hop_samples = block_samples / 4; // 75 % overlap
+
+    // If the signal is shorter than one block, measure the whole signal.
+    if weighted.len() < block_samples {
+        let mean_sq: f64 =
+            weighted.iter().map(|x| x * x).sum::<f64>() / weighted.len() as f64;
+        if mean_sq < 1e-20 {
+            return f64::NEG_INFINITY;
+        }
+        return -0.691 + 10.0 * mean_sq.log10();
+    }
+
+    // Block-based mean-square powers
+    let mut block_powers: Vec<f64> = Vec::new();
+    let mut pos = 0;
+    while pos + block_samples <= weighted.len() {
+        let block = &weighted[pos..pos + block_samples];
+        let mean_sq: f64 = block.iter().map(|x| x * x).sum::<f64>() / block.len() as f64;
+        block_powers.push(mean_sq);
+        pos += hop_samples;
+    }
+
+    // Absolute gate: −70 LUFS  →  threshold in linear power
+    let abs_gate = 10f64.powf((-70.0 + 0.691) / 10.0);
+    let gated_abs: Vec<f64> = block_powers
+        .iter()
+        .copied()
+        .filter(|&p| p > abs_gate)
+        .collect();
+    if gated_abs.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+
+    // Relative gate: mean of absolute-gated − 10 dB
+    let mean_abs: f64 = gated_abs.iter().sum::<f64>() / gated_abs.len() as f64;
+    let rel_gate = mean_abs * 10f64.powf(-1.0); // −10 dB
+    let gated_rel: Vec<f64> = gated_abs
+        .iter()
+        .copied()
+        .filter(|&p| p > rel_gate)
+        .collect();
+    if gated_rel.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+
+    let mean_rel: f64 = gated_rel.iter().sum::<f64>() / gated_rel.len() as f64;
+    -0.691 + 10.0 * mean_rel.log10()
+}
+
+// ── Silence trimming helpers ──────────────────────────────────────────
+
+/// Compute per-frame RMS in dB, returning (rms_db_values, frame_hop_samples).
+fn frame_rms_db(audio: &[f32], sample_rate: u32) -> (Vec<f64>, usize) {
+    let frame_len = (sample_rate as f64 * 0.02) as usize; // 20 ms window
+    let hop_len = (sample_rate as f64 * 0.01) as usize; // 10 ms hop
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i + frame_len <= audio.len() {
+        let frame = &audio[i..i + frame_len];
+        let rms_val: f64 = frame.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>()
+            / frame_len as f64;
+        let rms_val = rms_val.sqrt();
+        let db = if rms_val < 1e-10 {
+            f64::NEG_INFINITY
+        } else {
+            20.0 * rms_val.log10()
+        };
+        values.push(db);
+        i += hop_len;
+    }
+    (values, hop_len)
+}
+
+/// Trim silence from audio for loudness measurement (matching Python `trim_silence` logic).
+/// Returns `(trimmed_audio, start_sample, end_sample)`.
+fn trim_silence_range(
+    audio: &[f32],
+    sample_rate: u32,
+    threshold_db: f64,
+) -> (usize, usize) {
+    let (rms_values, hop_len) = frame_rms_db(audio, sample_rate);
+    let voiced: Vec<usize> = rms_values
+        .iter()
+        .enumerate()
+        .filter(|&(_, &db)| db > threshold_db)
+        .map(|(i, _)| i)
+        .collect();
+
+    if voiced.is_empty() {
+        return (0, audio.len());
+    }
+
+    let first = voiced[0];
+    let last = *voiced.last().unwrap();
+    let padding_frames = ((sample_rate as f64 * 0.1) as usize) / hop_len; // 100 ms padding
+
+    let frame_len = (sample_rate as f64 * 0.02) as usize;
+    let start_sample = (first * hop_len).max(0);
+    let end_sample = ((last + 1 + padding_frames) * hop_len + frame_len).min(audio.len());
+
+    (start_sample, end_sample)
+}
+
+/// Loudness normalization using ITU-R BS.1770-4 LUFS measurement.
+///
+/// Matches Python `loudness_norm()` from `util/audio.py`:
+/// - Optionally trims silence before measurement (`trim_silence`)
+/// - Measures integrated loudness with K-weighting + gating
+/// - Applies strength-blended gain toward `target_lufs`
+/// - Reconstructs full-length output with crossfade if trimmed
+pub fn loudness_normalize(
+    audio: &[f32],
+    sample_rate: u32,
+    target_lufs: f64,
+    block_size: f64,
+    strength: f64,
+    trim_silence: bool,
+    silence_threshold_db: f64,
+) -> Vec<f32> {
     if audio.is_empty() || strength < 0.01 {
         return audio.to_vec();
     }
 
-    let current_rms = rms(audio);
-    if current_rms < 1e-8 {
+    let original_length = audio.len();
+
+    // Determine measurement region
+    let (trim_start, trim_end) = if trim_silence {
+        trim_silence_range(audio, sample_rate, silence_threshold_db)
+    } else {
+        (0, audio.len())
+    };
+
+    let mut measure_audio = audio[trim_start..trim_end].to_vec();
+
+    // Pad if shorter than one block (matching Python)
+    let min_block = (sample_rate as f64 * block_size) as usize;
+    if measure_audio.len() < min_block {
+        let pad_len = min_block - measure_audio.len();
+        // reflect-pad
+        let orig_len = measure_audio.len();
+        measure_audio.reserve(pad_len);
+        for i in 0..pad_len {
+            let idx = reflect_index(i, orig_len);
+            measure_audio.push(measure_audio[idx]);
+        }
+    }
+
+    // Measure integrated loudness
+    let current_lufs = measure_lufs(&measure_audio, sample_rate, block_size);
+    if current_lufs.is_infinite() {
+        // Signal is essentially silent — don't boost
         return audio.to_vec();
     }
 
-    // Approximate LUFS from RMS (simplified)
-    let current_lufs = 20.0 * current_rms.log10();
-    let gain_db = (target_lufs - current_lufs) * (strength / 100.0);
-    let gain = 10.0f32.powf(gain_db / 20.0);
+    // Strength-blended target (matches Python):
+    //   final_loudness = current + (target - current) * strength / 100
+    let final_lufs = current_lufs + (target_lufs - current_lufs) * strength / 100.0;
+    let gain_db = final_lufs - current_lufs;
+    let gain = 10f64.powf(gain_db / 20.0) as f32;
 
-    audio.iter().map(|&x| x * gain).collect()
+    if !trim_silence || (trim_start == 0 && trim_end >= original_length) {
+        // No trimming — straightforward gain
+        let mut out: Vec<f32> = audio.iter().map(|&x| x * gain).collect();
+        // Truncate if we padded
+        out.truncate(original_length);
+        return out;
+    }
+
+    // Trimming was applied — reconstruct with crossfade (matching Python)
+    let mut output = vec![0.0f32; original_length];
+    let available_length = (trim_end - trim_start).min(original_length - trim_start);
+
+    // Fade-out window at the tail (200 ms or 1/4 of available length)
+    let fade_length = ((sample_rate as f64 * 0.2) as usize).min(available_length / 4);
+
+    for i in 0..available_length {
+        let mut fade = 1.0f32;
+        if fade_length > 0 && i >= available_length - fade_length {
+            let pos = i - (available_length - fade_length);
+            fade = 1.0 - pos as f32 / fade_length as f32;
+        }
+        output[trim_start + i] = audio[trim_start + i] * gain * fade;
+    }
+
+    // Crossfade remaining tail from original audio
+    let remain_start = trim_start + available_length;
+    if remain_start < original_length {
+        let remain_length = original_length - remain_start;
+        let crossfade_length = fade_length.min(remain_length);
+        for i in 0..remain_length {
+            let fade_in = if crossfade_length > 0 && i < crossfade_length {
+                i as f32 / crossfade_length as f32
+            } else {
+                1.0
+            };
+            output[remain_start + i] = audio[remain_start + i] * fade_in;
+        }
+    }
+
+    output
+}
+
+/// Helper: reflect index for padding (same as `reflect_index_mel` but for 1-D).
+fn reflect_index(i: usize, len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let period = 2 * (len - 1);
+    let i_mod = i % period;
+    if i_mod < len {
+        i_mod
+    } else {
+        period - i_mod
+    }
 }
 
 /// STFT computation using rustfft.

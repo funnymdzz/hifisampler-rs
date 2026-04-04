@@ -348,7 +348,15 @@ pub fn resample(
     // Loudness normalization (P flag)
     if config.processing.wave_norm {
         if flags.p > 0 {
-            render = loudness_normalize(&render, -16.0, flags.p as f32);
+            render = loudness_normalize(
+                &render,
+                config.sample_rate,
+                -16.0,  // target LUFS
+                0.400,  // block_size (400 ms)
+                flags.p as f64,
+                config.processing.wave_norm_clip_silence,
+                config.processing.silence_threshold,
+            );
         }
     }
 

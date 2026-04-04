@@ -25,6 +25,7 @@ hnsep:
 processing:
   wave_norm: false
   wave_norm_clip_silence: true
+  silence_threshold: -52.0
   loop_mode: false
   peak_limit: 1.0
 
