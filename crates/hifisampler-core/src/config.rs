@@ -56,6 +56,10 @@ pub struct ProcessingConfig {
     pub wave_norm: bool,
     #[serde(default = "default_true")]
     pub wave_norm_clip_silence: bool,
+    /// RMS threshold (dB) for silence detection during wave normalization.
+    /// Frames below this are considered silent (default: −52.0 dB).
+    #[serde(default = "default_silence_threshold")]
+    pub silence_threshold: f64,
     #[serde(default)]
     pub loop_mode: bool,
     #[serde(default = "default_peak_limit")]
@@ -131,6 +135,9 @@ fn default_vocoder_type() -> String {
 fn default_hnsep_model() -> PathBuf {
     PathBuf::from("models/hnsep/model.onnx")
 }
+fn default_silence_threshold() -> f64 {
+    -52.0
+}
 fn default_peak_limit() -> f32 {
     1.0
 }
@@ -196,6 +203,7 @@ impl Default for ProcessingConfig {
         Self {
             wave_norm: false,
             wave_norm_clip_silence: true,
+            silence_threshold: default_silence_threshold(),
             loop_mode: false,
             peak_limit: default_peak_limit(),
         }
