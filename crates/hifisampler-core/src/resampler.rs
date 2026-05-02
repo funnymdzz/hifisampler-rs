@@ -338,8 +338,6 @@ pub fn resample(
         render.iter_mut().for_each(|x| *x *= inv_scale as f32);
     }
 
-    let new_max = peak(&render);
-
     // Growl effect (HG flag)
     if flags.hg > 0 {
         render = apply_growl(&render, flags.hg as f32 / 100.0, config.sample_rate);
@@ -356,13 +354,19 @@ pub fn resample(
                 flags.p as f64,
                 config.processing.wave_norm_clip_silence,
                 config.processing.silence_threshold,
+                config.processing.wave_norm_max_boost_db,
+                config.processing.wave_norm_low_level_protect_db,
+                config.processing.wave_norm_tail_peak_limit_dbfs,
+                config.processing.wave_norm_tail_mode,
             );
         }
     }
 
-    // Peak limiting
-    if new_max > config.processing.peak_limit {
-        let gain = config.processing.peak_limit / new_max;
+    // Peak limiting — recompute actual peak AFTER all processing
+    // (loudness normalization may have boosted the signal significantly)
+    let final_max = peak(&render);
+    if final_max > config.processing.peak_limit {
+        let gain = config.processing.peak_limit / final_max;
         render.iter_mut().for_each(|x| *x *= gain);
     }
 
